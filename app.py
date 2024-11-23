@@ -111,13 +111,13 @@ def explain_prediction(team1, team2, team1_data, team2_data, win_prob):
     
     # Probabilitas dan Interpretasi
     if win_prob > 0.7:
-        confidence = "Sangat Yakin"
+        confidence = "Sangat Yakin Akan Menang"
     elif win_prob > 0.6:
-        confidence = "Cukup Yakin"
+        confidence = "Cukup Yakin Akan Menang"
     elif win_prob > 0.5:
-        confidence = "Sedikit Yakin"
+        confidence = "Sedikit Yakin Akan Menang"
     else:
-        confidence = "Tidak Yakin"
+        confidence = "Tidak Yakin Akan Menang"
     
     # Tambahkan tingkat kepercayaan
     explanations.append(f"📊 Tingkat Kepercayaan Prediksi: {confidence} ({win_prob:.2%})")
