@@ -1,32 +1,74 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, precision_score, f1_score
 
-# Fungsi untuk mempersiapkan data
-def prepare_data(matches):
-    # Preprocessing yang sama seperti di notebook sebelumnya
-    matches["date"] = pd.to_datetime(matches["date"])
-    matches["target"] = (matches["result"] == "W").astype("int")
-    matches["venue_code"] = matches["venue"].astype("category").cat.codes
-    matches["opp_code"] = matches["opponent"].astype("category").cat.codes
-    matches["hour"] = matches["time"].str.replace(":.+", "", regex=True).astype("int")
-    matches["day_code"] = matches["date"].dt.dayofweek
-    
-    # Rolling averages
-    cols = ["gf", "ga", "sh", "sot", "dist", "fk", "pk", "pkatt"]
-    new_cols = [f"{c}_rolling" for c in cols]
-    
-    matches_rolling = matches.groupby("team").apply(
-        lambda x: rolling_averages(x, cols, new_cols)
-    )
-    matches_rolling = matches_rolling.droplevel('team')
-    matches_rolling.index = range(matches_rolling.shape[0])
-    
-    return matches_rolling
+# Membaca dataset dari file CSV
+matches = pd.read_csv("matches.csv", index_col=0)
 
-# Fungsi rolling averages (sama seperti di notebook)
+# Menghapus kolom yang tidak relevan
+del matches["comp"]  # Menghapus kolom 'comp' karena hanya satu kompetisi
+del matches["notes"]  # Menghapus kolom 'notes' karena tidak relevan
+
+# Mengubah kolom 'date' menjadi tipe datetime
+matches["date"] = pd.to_datetime(matches["date"])
+
+# Membuat kolom target untuk hasil pertandingan (1 untuk menang, 0 untuk tidak)
+matches["target"] = (matches["result"] == "W").astype("int")
+
+# Menambahkan kode untuk venue dan lawan
+matches["venue_code"] = matches["venue"].astype("category").cat.codes
+matches["opp_code"] = matches["opponent"].astype("category").cat.codes
+
+# Mengambil jam dari kolom 'time'
+matches["hour"] = matches["time"].str.replace(":.+", "", regex=True).astype("int")
+
+# Mengambil kode hari dari tanggal
+matches["day_code"] = matches["date"].dt.dayofweek
+
+matches = matches.reset_index(drop=True)
+
+# Add team performance metrics
+matches['goals_scored'] = matches.groupby('team')['gf'].transform(lambda x: x.rolling(window=5).mean()).fillna(0)
+matches['goals_conceded'] = matches.groupby('team')['ga'].transform(lambda x: x.rolling(window=5).mean()).fillna(0)
+matches['shots_ratio'] = matches['sh'] / matches['sot'].replace(0, 1)
+
+# Menyiapkan model Random Forest
+from sklearn.ensemble import RandomForestClassifier
+rf = RandomForestClassifier(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=5, max_features='sqrt', random_state=1)
+
+# Memisahkan data menjadi data pelatihan dan pengujian
+train = matches[matches["date"] < '2022-01-01']
+test = matches[matches["date"] > '2022-01-01']
+
+# Mendefinisikan fitur yang digunakan untuk prediksi
+predictors = ["venue_code", "opp_code", "hour", "day_code", "goals_scored", "goals_conceded", "shots_ratio"]
+
+# Melatih model dengan data pelatihan
+rf.fit(train[predictors], train["target"])
+
+# Menghitung akurasi pada data pengujian
+accuracy = rf.score(test[predictors], test["target"])
+
+# Melakukan prediksi pada data pengujian
+preds = rf.predict(test[predictors])
+
+# Menghitung akurasi model
+error = accuracy_score(test["target"], preds)
+
+# Menggabungkan hasil aktual dan prediksi
+combined = pd.DataFrame(dict(actual=test["target"], predicted=preds))
+
+# Menghitung precision score
+precision = precision_score(test["target"], preds)
+
+# Mengelompokkan pertandingan berdasarkan tim
+grouped_matches = matches.groupby("team")
+group = grouped_matches.get_group("Manchester City").sort_values("date")
+
+# Fungsi untuk menghitung rolling averages
 def rolling_averages(group, cols, new_cols):
     group = group.sort_values("date")
     rolling_stats = group[cols].rolling(3, closed='left').mean()
@@ -34,145 +76,249 @@ def rolling_averages(group, cols, new_cols):
     group = group.dropna(subset=new_cols)
     return group
 
-# Fungsi untuk melatih model
-def train_model(matches_rolling):
-    predictors = ["venue_code", "opp_code", "hour", "day_code", 
-                  "gf_rolling", "ga_rolling", "sh_rolling", "sot_rolling", 
-                  "dist_rolling", "fk_rolling", "pk_rolling", "pkatt_rolling"]
-    
-    train = matches_rolling[matches_rolling["date"] < '2022-01-01']
-    
-    rf = RandomForestClassifier(n_estimators=50, min_samples_split=10, random_state=1)
+# Kolom yang digunakan untuk rolling averages
+cols = ["gf", "ga", "sh", "sot", "dist", "fk", "pk", "pkatt"]
+new_cols = [f"{c}_rolling" for c in cols]
+
+# Menghitung rolling averages untuk setiap tim
+matches_rolling = matches.groupby("team").apply(lambda x: rolling_averages(x, cols, new_cols))
+matches_rolling = matches_rolling.droplevel('team')  # Menghapus level multi-index
+matches_rolling.index = range(matches_rolling.shape[0])  # Mengatur ulang index
+
+# Fungsi untuk membuat prediksi
+def make_predictions(data, predictors):
+    train = data[data["date"] < '2022-01-01']
+    test = data[data["date"] > '2022-01-01']
     rf.fit(train[predictors], train["target"])
-    
-    return rf, predictors
+    preds = rf.predict(test[predictors])
+    combined = pd.DataFrame(dict(actual=test["target"], predicted=preds), index=test.index)
+    error = precision_score(test["target"], preds)
+    return combined, error
 
-# Fungsi untuk memprediksi
-def predict_match(model, predictors, team1_data, team2_data):
-    # Gabungkan fitur untuk prediksi
-    prediction_data = pd.DataFrame({
-        'venue_code': [team1_data['venue_code']],
-        'opp_code': [team2_data['opp_code']],
-        'hour': [team1_data['hour']],
-        'day_code': [team1_data['day_code']],
-        'gf_rolling': [team1_data['gf_rolling']],
-        'ga_rolling': [team1_data['ga_rolling']],
-        'sh_rolling': [team1_data['sh_rolling']],
-        'sot_rolling': [team1_data['sot_rolling']],
-        'dist_rolling': [team1_data['dist_rolling']],
-        'fk_rolling': [team1_data['fk_rolling']],
-        'pk_rolling': [team1_data['pk_rolling']],
-        'pkatt_rolling': [team1_data['pkatt_rolling']]
-    })
-    
-    prediction = model.predict_proba(prediction_data)
-    return prediction[0][1]  # Probabilitas menang
+# Membuat prediksi dan menghitung error
+combined, error = make_predictions(matches_rolling, predictors + new_cols)
 
-def explain_prediction(team1, team2, team1_data, team2_data, win_prob):
-    explanations = []
-    
-    # Analisis Rolling Averages
-    if team1_data['gf_rolling'] > team2_data['gf_rolling']:
-        explanations.append(f"🥅 {team1} memiliki rata-rata gol yang lebih tinggi ({team1_data['gf_rolling']:.2f}) dibandingkan {team2} ({team2_data['gf_rolling']:.2f}) dalam 3 pertandingan terakhir.")
-    
-    if team1_data['ga_rolling'] < team2_data['ga_rolling']:
-        explanations.append(f"🛡️ {team1} memiliki rata-rata gol yang diterima lebih rendah ({team1_data['ga_rolling']:.2f}) dibandingkan {team2} ({team2_data['ga_rolling']:.2f}) dalam 3 pertandingan terakhir.")
-    
-    # Analisis Tembakan
-    if team1_data['sh_rolling'] > team2_data['sh_rolling']:
-        explanations.append(f"🏹 {team1} lebih sering melakukan tembakan ke gawang ({team1_data['sh_rolling']:.2f}) dibandingkan {team2} ({team2_data['sh_rolling']:.2f}).")
-    
-    if team1_data['sot_rolling'] > team2_data['sot_rolling']:
-        explanations.append(f"🎯 {team1} memiliki akurasi tembakan yang lebih baik ({team1_data['sot_rolling']:.2f}) dibandingkan {team2} ({team2_data['sot_rolling']:.2f}).")
-    
-    # Faktor Venue (Home/Away)
-    venue_mapping = {
-        0: "Kandang",
-        1: "Tandang"
-    }
-    venue_type = venue_mapping.get(team1_data['venue_code'], "Netral")
-    explanations.append(f"🏟️ Pertandingan di {venue_type}. {team1} memiliki keunggulan bermain di kandang.")
-    
-    # Faktor Waktu
-    hour_categories = {
-        (0, 12): "Pagi",
-        (12, 18): "Siang",
-        (18, 24): "Malam"
-    }
-    
-    def categorize_hour(hour):
-        for (start, end), category in hour_categories.items():
-            if start <= hour < end:
-                return category
-        return "Malam"
-    
-    match_time = categorize_hour(team1_data['hour'])
-    explanations.append(f"⏰ Pertandingan pada waktu {match_time}. Waktu ini bisa mempengaruhi performa tim.")
-    
-    # Probabilitas dan Interpretasi
-    if win_prob > 0.7:
-        confidence = "Sangat Yakin Akan Menang"
-    elif win_prob > 0.6:
-        confidence = "Cukup Yakin Akan Menang"
-    elif win_prob > 0.5:
-        confidence = "Sedikit Yakin Akan Menang"
+# Menggabungkan hasil prediksi dengan informasi tambahan dari matches_rolling
+combined = combined.merge(matches_rolling[["date", "team", "opponent", "result"]], left_index=True, right_index=True)
+
+# Mendefinisikan kelas untuk menangani nilai yang hilang
+class MissingDict(dict):
+    __missing__ = lambda self, key: key
+
+# Pemetaan nama tim untuk konsistensi
+map_values = {
+    "Brighton and Hove Albion": "Brighton",
+    "Manchester United": "Manchester Utd",
+    "Newcastle United": "Newcastle Utd",
+    "Tottenham Hotspur": "Tottenham",
+    "West Ham United": "West Ham",
+    "Wolverhampton Wanderers": "Wolves"
+}
+mapping = MissingDict(**map_values)
+
+# Menambahkan kolom baru untuk nama tim yang dipetakan
+combined["new_team"] = combined["team"].map(mapping)
+
+# Menggabungkan hasil prediksi dengan informasi tim baru
+merged = combined.merge(combined, left_on=["date", "new_team"], right_on=["date", "opponent"])
+
+
+
+
+# Streamlit Interface
+st.title("Football premier league Prediction")
+st.markdown("### Predict the outcome of a football match")
+
+# Team selection
+team_options = sorted(matches['team'].unique())
+team1 = st.sidebar.selectbox('Select Home Team', team_options)
+team2_options = [team for team in team_options if team != team1]
+team2 = st.sidebar.selectbox('Select Away Team', team2_options)
+
+if st.sidebar.button('Predict Match Result'):
+    # First, prepare the data for both teams with rolling averages
+    def prepare_team_data(team_name, opponent_name, venue_code, hour=16, day_code=6):
+        base_data = {
+            'venue_code': [venue_code],
+            'opp_code': [matches[matches['team'] == opponent_name]['opp_code'].iloc[0]],
+            'hour': [hour],
+            'day_code': [day_code],
+            'goals_scored': [matches[matches['team'] == team_name]['goals_scored'].mean()],
+            'goals_conceded': [matches[matches['team'] == team_name]['goals_conceded'].mean()],
+            'shots_ratio': [matches[matches['team'] == team_name]['shots_ratio'].mean()]
+        }
+        
+        # Add rolling averages
+        for col in cols:
+            base_data[f'{col}_rolling'] = [matches[matches['team'] == team_name][col].mean()]
+        
+        return pd.DataFrame(base_data)
+
+    # Update predictors to include rolling averages
+    predictors = ["venue_code", "opp_code", "hour", "day_code", "goals_scored", "goals_conceded", "shots_ratio"] + new_cols
+
+    # Prepare data for both teams
+    team1_data = prepare_team_data(team1, team2, 0)  # Home team
+    team2_data = prepare_team_data(team2, team1, 1)  # Away team
+
+    # Make predictions
+    team1_pred = rf.predict(team1_data[predictors])
+    team1_prob = rf.predict_proba(team1_data[predictors])[0][1]
+    team2_pred = rf.predict(team2_data[predictors])
+    team2_prob = rf.predict_proba(team2_data[predictors])[0][1]
+
+    # Normalize probabilities
+    total_prob = team1_prob + team2_prob
+    remaining_prob = 1 - total_prob
+    team1_normalized = team1_prob + (remaining_prob * (team1_prob/total_prob))
+    team2_normalized = team2_prob + (remaining_prob * (team2_prob/total_prob))
+
+    # Display results
+    st.write("### Match Prediction")
+    st.write(f"Probability of {team1} winning: {team1_normalized*100:.2f}%")
+    st.write(f"Probability of {team2} winning: {team2_normalized*100:.2f}%")
+
+    if team1_normalized > team2_normalized:
+        st.success(f"🏆 {team1} diprediksi akan memenangkan pertandingan!")
     else:
-        confidence = "Tidak Yakin Akan Menang"
-    
-    # Tambahkan tingkat kepercayaan
-    explanations.append(f"📊 Tingkat Kepercayaan Prediksi: {confidence} ({win_prob:.2%})")
-    
-    return explanations
+        st.success(f"🏆 {team2} diprediksi akan memenangkan pertandingan!")
 
-# Aplikasi Streamlit
-def main():
-    st.title('Prediksi Pertandingan Sepak Bola')
     
-    # Muat data
-    matches = pd.read_csv("matches.csv", index_col=0)
-    
-    # Siapkan data
-    matches_rolling = prepare_data(matches)
-    
-    # Latih model
-    model, predictors = train_model(matches_rolling)
-    
-    # Daftar tim
-    teams = sorted(matches['team'].unique())
-    
-    # Pilih tim
-    st.sidebar.header('Pilih Tim Premier League')
-    
-    # Tim Pertama
-    team1 = st.sidebar.selectbox('Tim Pertama', teams)
-    
-    # Tim Kedua (hanya tim yang berbeda dari tim pertama)
-    team2_options = [team for team in teams if team != team1]
-    team2 = st.sidebar.selectbox('Tim Kedua', team2_options)
-    
-    # Ambil data terakhir untuk setiap tim
-    team1_data = matches_rolling[matches_rolling['team'] == team1].iloc[-1]
-    team2_data = matches_rolling[matches_rolling['team'] == team2].iloc[-1]
-    
-    # Prediksi
-    if st.sidebar.button('Prediksi Pertandingan'):
-        win_prob = predict_match(model, predictors, team1_data, team2_data)
-        
-        st.write(f"Probabilitas {team1} menang: {win_prob:.2%}")
-        st.write(f"Probabilitas {team2} menang: {1-win_prob:.2%}")
-        
-        if win_prob > 0.5:
-            st.success(f"Prediksi: {team1} akan menang!")
-        else:
-            st.success(f"Prediksi: {team2} akan menang!")
+    # Display team statistics
+    # Display team statistics
+    st.write("### Overall Team Performance")
+    col1, col2 = st.columns(2)
 
-        # Tambahkan penjelasan
-        st.subheader("Alasan Prediksi:")
-        explanations = explain_prediction(team1, team2, team1_data, team2_data, win_prob)
-        
-        for explanation in explanations:
-            st.markdown(f"- {explanation}")
+    with col1:
+        st.write(f"**{team1} Stats (Overall Average)**")
+        st.write(f"Goals Scored: {matches[matches['team'] == team1]['gf'].mean():.2f}")
+        st.write(f"Goals Conceded: {matches[matches['team'] == team1]['ga'].mean():.2f}")
+        st.write(f"Shots Ratio: {matches[matches['team'] == team1]['shots_ratio'].mean():.2f}")
+        st.write(f"Venue: {matches['venue'][matches['team'] == team1].iloc[-1]}")
+        st.write(f"Most Common Match Hour: {matches[matches['team'] == team1]['hour'].mode().iloc[0]}:00")
+        st.write(f"Most Common Day: {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][matches[matches['team'] == team1]['day_code'].mode().iloc[0]]}")
 
-# Jalankan aplikasi
-if __name__ == '__main__':
-    main()
+    with col2:
+        st.write(f"**{team2} Stats (Overall Average)**")
+        st.write(f"Goals Scored: {matches[matches['team'] == team2]['gf'].mean():.2f}")
+        st.write(f"Goals Conceded: {matches[matches['team'] == team2]['ga'].mean():.2f}")
+        st.write(f"Shots Ratio: {matches[matches['team'] == team2]['shots_ratio'].mean():.2f}")
+        st.write(f"Venue: {matches['venue'][matches['team'] == team2].iloc[-1]}")
+        st.write(f"Most Common Match Hour: {matches[matches['team'] == team2]['hour'].mode().iloc[0]}:00")
+        st.write(f"Most Common Day: {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][matches[matches['team'] == team2]['day_code'].mode().iloc[0]]}")
+
+        
+    st.write("*Opponent Code tinggi menunjukkan tim ini sering berhadapan dengan tim lawan yang memiliki performa historis dan kemenangan yang lebih baik")
+    
+    # Visualization
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Define key performance metrics
+# Define key performance metrics
+    stats = ['Goals Scored', 'Goals Conceded', 'Shots Ratio', 'Match Hour', 'Match Day', 'Opponent Code']
+    team1_stats = [
+        float(matches[matches['team'] == team1]['gf'].mean()),
+        float(matches[matches['team'] == team1]['ga'].mean()),
+        float(matches[matches['team'] == team1]['shots_ratio'].mean()),
+        float(matches[matches['team'] == team1]['hour'].mode().iloc[0]),
+        float(matches[matches['team'] == team1]['day_code'].mode().iloc[0]),
+        float(team1_data['opp_code'].iloc[0])
+    ]
+
+    team2_stats = [
+        float(matches[matches['team'] == team2]['gf'].mean()),
+        float(matches[matches['team'] == team2]['ga'].mean()),
+        float(matches[matches['team'] == team2]['shots_ratio'].mean()),
+        float(matches[matches['team'] == team2]['hour'].mode().iloc[0]),
+        float(matches[matches['team'] == team2]['day_code'].mode().iloc[0]),
+        float(team2_data['opp_code'].iloc[0])
+    ]
+
+    x = np.arange(len(stats))
+    width = 0.35
+
+    # Create styled bars
+    bars1 = ax.bar(x - width/2, team1_stats, width, label=team1, color='#2ecc71', alpha=0.8)
+    bars2 = ax.bar(x + width/2, team2_stats, width, label=team2, color='#3498db', alpha=0.8)
+
+    # Style the plot
+    ax.set_ylabel('Performance Values', fontsize=12)
+    ax.set_title('Team Performance Comparison', fontsize=14, pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels(stats, rotation=30, ha='right')
+    ax.legend(loc='upper right')
+
+    # Add value labels with improved positioning
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.2f}',
+                    ha='center', va='bottom',
+                    fontsize=10)
+
+    # Enhance grid and layout
+    ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+
+    # Display in Streamlit
+    st.pyplot(fig)
+
+
+    # Calculate team form (last 5 matches)
+    def get_team_form(team_name):
+        recent_matches = matches[matches['team'] == team_name].sort_values('date').tail(5)
+        wins = sum(recent_matches['result'] == 'W')
+        draws = sum(recent_matches['result'] == 'D')
+        losses = sum(recent_matches['result'] == 'L')
+        return wins, draws, losses
+
+    # Get form for both teams
+    team1_wins, team1_draws, team1_losses = get_team_form(team1)
+    team2_wins, team2_draws, team2_losses = get_team_form(team2)
+
+    # Display team form
+    st.write("### Recent Team Form (Last 5 Matches)")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write(f"**{team1}**")
+        st.write(f"Wins: {team1_wins} | Draws: {team1_draws} | Losses: {team1_losses}")
+        form_score1 = (team1_wins * 3 + team1_draws) / 15 * 100
+        st.progress(form_score1/100)
+        st.write(f"Form: {form_score1:.1f}%")
+
+    with col2:
+        st.write(f"**{team2}**")
+        st.write(f"Wins: {team2_wins} | Draws: {team2_draws} | Losses: {team2_losses}")
+        form_score2 = (team2_wins * 3 + team2_draws) / 15 * 100
+        st.progress(form_score2/100)
+        st.write(f"Form: {form_score2:.1f}%")
+
+    # Add confidence message based on model accuracy
+    st.write("### Prediction Confidence")
+    result_counts = merged[(merged["predicted_x"] == 1) & (merged["predicted_y"] == 0)]["actual_x"].value_counts()
+
+    total_actual = result_counts.sum()
+
+    # Menghitung jumlah hasil yang diprediksi 1 dan sebenarnya 1
+    predicted_correct = result_counts.get(1, 0)  # Menggunakan get untuk menghindari KeyError jika 1 tidak ada
+
+    # Menghitung proporsi
+    proportion = predicted_correct / total_actual * 100 if total_actual > 0 else 0
+   
+    if proportion >= 75:
+        st.success(f"High confidence prediction ({proportion:.1f}% accuracy)")
+    elif proportion >= 60:
+        st.info(f"Moderate confidence prediction ({proportion:.1f}% accuracy)")
+    else:
+        st.warning(f"Low confidence prediction ({proportion:.1f}% accuracy)")
+
+    # Add head-to-head analysis
+    st.write("### Prediction Analysis")
+    if abs(team1_normalized - team2_normalized) > 0.2:
+        st.write("Strong prediction: Clear favorite identified")
+    elif abs(team1_normalized - team2_normalized) > 0.1:
+        st.write("Moderate prediction: Slight advantage to favorite")
+    else:
+        st.write("Close prediction: Match could go either way")
